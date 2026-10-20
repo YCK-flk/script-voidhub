@@ -1,5 +1,5 @@
 -- language: Lua | executor: Synapse X / KRNL / Fluxus / Delta (PC)
--- VoidHub v4 — ESP · Invisibility · Fly (noclip)
+-- VoidHub v5 — ESP · Invisibility · Aimbot · TriggerBot · Fly
 
 local Players      = game:GetService("Players")
 local RunService   = game:GetService("RunService")
@@ -16,8 +16,14 @@ pcall(function()
 end)
 
 -- ── STATE ─────────────────────────────────────────────────────────────────────
-local ST  = { ESP=false, Invis=false, Fly=false }
-local CFG = { ESPDist=500, FlySpeed=60 }
+local ST  = { ESP=false, Invis=false, Aimbot=false, TriggerBot=false, Fly=false }
+local CFG = {
+    ESPDist        = 500,
+    AimbotFOV      = 120,
+    AimbotSmooth   = 0.18,   -- mantido para compatibilidade; não usado diretamente
+    AimbotStrength = 100,
+    FlySpeed       = 60,
+}
 
 -- ══════════════════════════════════════════════════════════════════════════════
 -- ESP
@@ -85,29 +91,76 @@ local function applyInvis(char, on)
 end
 
 -- ══════════════════════════════════════════════════════════════════════════════
+-- AIMBOT
+-- ══════════════════════════════════════════════════════════════════════════════
+local fovCircle = newDraw("Circle",{
+    Visible=false, Radius=CFG.AimbotFOV,
+    Color=Color3.fromRGB(255,255,255), Thickness=1,
+    Filled=false, NumSides=64,
+})
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- TRIGGERBOT
+-- ══════════════════════════════════════════════════════════════════════════════
+--[[
+  Raycast do Camera.CFrame.Position em LookVector * 2000 studs.
+  RaycastParams exclui o char local para não auto-triggerar.
+  Se o hit for descendente de qualquer char inimigo → mouse1press + release.
+  Cooldown: 150 ms entre disparos para não travar a arma.
+]]
+local TRIGGER_CD    = 0.15   -- segundos entre disparos
+local lastTrigger   = 0
+local triggerParams = RaycastParams.new()
+triggerParams.FilterType = Enum.RaycastFilterType.Exclude
+
+local function updateTriggerFilter()
+    local char = LocalPlayer.Character
+    triggerParams.FilterDescendantsInstances = char and {char} or {}
+end
+
+local function triggerFire()
+    -- mouse1press / mouse1release: API do executor (Synapse X, KRNL, Fluxus)
+    pcall(function()
+        if mouse1press then mouse1press() end
+    end)
+    task.delay(0.06, function()
+        pcall(function()
+            if mouse1release then mouse1release() end
+        end)
+    end)
+end
+
+local function triggerCheck()
+    if not ST.TriggerBot then return end
+    local now = tick()
+    if now - lastTrigger < TRIGGER_CD then return end
+
+    updateTriggerFilter()
+    local origin = Camera.CFrame.Position
+    local dir    = Camera.CFrame.LookVector * 2000
+    local result = workspace:Raycast(origin, dir, triggerParams)
+
+    if result and result.Instance then
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p ~= LocalPlayer and p.Character
+               and result.Instance:IsDescendantOf(p.Character) then
+                lastTrigger = now
+                triggerFire()
+                return
+            end
+        end
+    end
+end
+
+-- ══════════════════════════════════════════════════════════════════════════════
 -- FLY + NOCLIP
 -- ══════════════════════════════════════════════════════════════════════════════
 local flyConn = nil
 
---[[
-  Mecânica:
-  · PlatformStand = true → humanoid solta o controle, personagem fica em idle
-  · Cada Heartbeat: CanCollide = false em todos os BaseParts (noclip contínuo)
-  · Direção de movimento = WASD relativo ao LookVector/RightVector da câmera
-    W/S → move na direção que a câmera aponta (pitch incluído → sobe se olhar p/ cima)
-    A/D → strafe horizontal puro (RightVector sem componente Y)
-    Space / LCtrl → sobe / desce no eixo Y global
-    LShift → dobra a velocidade
-  · AssemblyLinearVelocity zerado a cada frame → anula gravidade/física residual
-  · Ao desativar: CanCollide restaurado, PlatformStand = false
-]]
-
 local function setNoClip(char, on)
     if not char then return end
     for _, p in ipairs(char:GetDescendants()) do
-        if p:IsA("BasePart") then
-            p.CanCollide = not on
-        end
+        if p:IsA("BasePart") then p.CanCollide = not on end
     end
 end
 
@@ -120,32 +173,28 @@ end
 
 local function startFly()
     ST.Fly = true
-    local char, hum, root = getCharParts()
-    if not char or not hum or not root then return end
-    hum.PlatformStand = true
+    local char, hum, _ = getCharParts()
+    if hum then hum.PlatformStand = true end
 
     flyConn = RunService.Heartbeat:Connect(function(dt)
         local c, h, r = getCharParts()
         if not c or not h or not r then return end
 
-        -- noclip contínuo (cobre partes novas após respawn ou mudança de char)
         setNoClip(c, true)
         h.PlatformStand = true
 
-        -- vetores de câmera
-        local camCF   = Camera.CFrame
-        local look    = camCF.LookVector               -- direção com pitch
-        local right   = Vector3.new(camCF.RightVector.X, 0, camCF.RightVector.Z)  -- horizontal puro
+        local camCF = Camera.CFrame
+        local look  = camCF.LookVector
+        local right = Vector3.new(camCF.RightVector.X, 0, camCF.RightVector.Z)
         if right.Magnitude > 0 then right = right.Unit end
 
-        local move = Vector3.new(0, 0, 0)
-
-        if UIS:IsKeyDown(Enum.KeyCode.W) then          move = move + look         end
-        if UIS:IsKeyDown(Enum.KeyCode.S) then          move = move - look         end
-        if UIS:IsKeyDown(Enum.KeyCode.A) then          move = move - right        end
-        if UIS:IsKeyDown(Enum.KeyCode.D) then          move = move + right        end
-        if UIS:IsKeyDown(Enum.KeyCode.Space) then      move = move + Vector3.yAxis end
-        if UIS:IsKeyDown(Enum.KeyCode.LeftControl) then move = move - Vector3.yAxis end
+        local move = Vector3.new(0,0,0)
+        if UIS:IsKeyDown(Enum.KeyCode.W)            then move = move + look          end
+        if UIS:IsKeyDown(Enum.KeyCode.S)            then move = move - look          end
+        if UIS:IsKeyDown(Enum.KeyCode.A)            then move = move - right         end
+        if UIS:IsKeyDown(Enum.KeyCode.D)            then move = move + right         end
+        if UIS:IsKeyDown(Enum.KeyCode.Space)        then move = move + Vector3.yAxis end
+        if UIS:IsKeyDown(Enum.KeyCode.LeftControl)  then move = move - Vector3.yAxis end
 
         local speed = CFG.FlySpeed
         if UIS:IsKeyDown(Enum.KeyCode.LeftShift) then speed = speed * 2 end
@@ -153,8 +202,6 @@ local function startFly()
         if move.Magnitude > 0 then
             r.CFrame = r.CFrame + move.Unit * speed * dt
         end
-
-        -- zera física residual (gravidade, empurrões)
         pcall(function() r.AssemblyLinearVelocity = Vector3.new(0,0,0) end)
     end)
 end
@@ -171,15 +218,23 @@ end
 LocalPlayer.CharacterAdded:Connect(function(char)
     task.wait(0.5)
     if ST.Invis then applyInvis(char, true) end
-    if ST.Fly   then
-        -- reconecta fly no novo char sem toggle manual
+    if ST.Fly then
         if flyConn then flyConn:Disconnect(); flyConn = nil end
         startFly()
     end
 end)
 
--- ── RENDER — só ESP (aimbot removido) ─────────────────────────────────────────
-local mainConn = RunService.RenderStepped:Connect(function()
+-- ══════════════════════════════════════════════════════════════════════════════
+-- RENDER — ESP + Aimbot + TriggerBot
+-- ══════════════════════════════════════════════════════════════════════════════
+local mainConn = RunService.RenderStepped:Connect(function(deltaTime)
+    local vp     = Camera.ViewportSize
+    local center = Vector2.new(vp.X*.5, vp.Y*.5)
+    fovCircle.Position = center
+
+    local bestSD   = CFG.AimbotFOV
+    local bestHead = nil
+
     for player, e in pairs(pool) do
         local char = player.Character
         if not char then hideEntry(e); continue end
@@ -187,7 +242,17 @@ local mainConn = RunService.RenderStepped:Connect(function()
         local head = char:FindFirstChild("Head")
         if not root or not head then hideEntry(e); continue end
 
-        if not ST.ESP or (Camera.CFrame.Position - root.Position).Magnitude > CFG.ESPDist then
+        -- aimbot target acquisition
+        if ST.Aimbot then
+            local sp, ok = w2s(head.Position)
+            if ok then
+                local sd = (sp - center).Magnitude
+                if sd < bestSD then bestSD=sd; bestHead=head end
+            end
+        end
+
+        -- ESP
+        if not ST.ESP or (Camera.CFrame.Position-root.Position).Magnitude > CFG.ESPDist then
             hideEntry(e)
         else
             local tW = head.Position + Vector3.new(0, head.Size.Y*.5+.1, 0)
@@ -216,6 +281,18 @@ local mainConn = RunService.RenderStepped:Connect(function()
             end
         end
     end
+
+    -- aimbot lerp (decaimento exponencial, framerate-independente)
+    if ST.Aimbot and bestHead then
+        local s = CFG.AimbotStrength
+        local k = s <= 100 and (12*(s/100)) or (12+(s-100)*1.76)
+        local alpha = math.clamp(1 - math.exp(-k * deltaTime), 0, 1)
+        Camera.CFrame = Camera.CFrame:Lerp(
+            CFrame.new(Camera.CFrame.Position, bestHead.Position), alpha)
+    end
+
+    -- triggerbot (roda no mesmo frame após o aimbot para aproveitar a câmera já corrigida)
+    triggerCheck()
 end)
 
 for _,p in ipairs(Players:GetPlayers()) do buildEntry(p) end
@@ -229,6 +306,7 @@ Players.PlayerRemoving:Connect(dropEntry)
 local sliderConns = {}
 local function cleanup()
     mainConn:Disconnect()
+    fovCircle:Remove()
     stopFly()
     for p in pairs(pool) do dropEntry(p) end
     for _,c in ipairs(sliderConns) do pcall(function() c:Disconnect() end) end
@@ -236,10 +314,10 @@ end
 _G.VH_cleanup = cleanup
 
 -- ══════════════════════════════════════════════════════════════════════════════
--- GUI — tokens de design (idênticos ao v3)
+-- GUI — tokens de design (idênticos ao v3/v4)
 -- ══════════════════════════════════════════════════════════════════════════════
 local W     = 500
-local H     = 340
+local H     = 430   -- altura aumentada para acomodar seções extras
 local BAR_H =  44
 
 local C = {
@@ -270,10 +348,10 @@ local TI  = TweenInfo.new(0.13, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
 local TI2 = TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
 
 local function corner(p, r)
-    local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0,r); c.Parent = p
+    local c=Instance.new("UICorner"); c.CornerRadius=UDim.new(0,r); c.Parent=p
 end
 local function stroke(p, col, th)
-    local s = Instance.new("UIStroke"); s.Color = col; s.Thickness = th; s.Parent = p
+    local s=Instance.new("UIStroke"); s.Color=col; s.Thickness=th; s.Parent=p
 end
 
 local SG = Instance.new("ScreenGui")
@@ -309,11 +387,10 @@ TBSep.Size=UDim2.new(1,0,0,1); TBSep.Position=UDim2.new(0,0,1,-1)
 TBSep.BackgroundColor3=C.Border; TBSep.BorderSizePixel=0; TBSep.ZIndex=10; TBSep.Parent=TopBar
 
 local LED_D=12; local LED_GAP=8; local LED_X=14
-local minimized=false
-local ContentArea
+local minimized=false; local ContentArea
 
 local function makeLED(xOff, col)
-    local Btn = Instance.new("TextButton")
+    local Btn=Instance.new("TextButton")
     Btn.Size=UDim2.new(0,LED_D,0,LED_D); Btn.Position=UDim2.new(0,xOff,0.5,-(LED_D/2))
     Btn.BackgroundColor3=col; Btn.BorderSizePixel=0; Btn.Text=""; Btn.ZIndex=12
     corner(Btn,LED_D/2); Btn.Parent=TopBar
@@ -332,7 +409,7 @@ local ledYel = makeLED(LED_X+LED_D+LED_GAP,       C.LEDYel)
 local ledGrn = makeLED(LED_X+(LED_D+LED_GAP)*2,   C.LEDGrn)
 
 local function makeWindowButton(text, xOffset, color, callback)
-    local btn = Instance.new("TextButton")
+    local btn=Instance.new("TextButton")
     btn.Size=UDim2.new(0,24,0,24); btn.Position=UDim2.new(1,xOffset,0.5,-12)
     btn.BackgroundColor3=color; btn.BorderSizePixel=0
     btn.Text=text; btn.TextColor3=C.Text; btn.TextSize=18
@@ -377,13 +454,12 @@ corner(VerPill,8); VerPill.Parent=TopBar
 
 local VerTxt=Instance.new("TextLabel")
 VerTxt.Size=UDim2.new(1,0,1,0); VerTxt.BackgroundTransparency=1
-VerTxt.Text="v4.0"; VerTxt.TextColor3=C.Accent
+VerTxt.Text="v5.0"; VerTxt.TextColor3=C.Accent
 VerTxt.TextSize=10; VerTxt.Font=Enum.Font.GothamBold
 VerTxt.TextXAlignment=Enum.TextXAlignment.Center; VerTxt.ZIndex=12; VerTxt.Parent=VerPill
 
 TopBar.Active=true
 local dragging,dragStart,frameStart=false,nil,nil
-
 TopBar.InputBegan:Connect(function(input)
     if input.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
     local p=input.Position
@@ -506,6 +582,44 @@ local function makeToggle(parent, text, descOrCb, cbOrNil)
     end)
 end
 
+local function makeSubToggle(parent, text, cb)
+    rowOrder=rowOrder+1
+    local Row=Instance.new("Frame")
+    Row.Size=UDim2.new(1,-10,0,36); Row.BackgroundColor3=C.RowAlt
+    Row.BorderSizePixel=0; Row.LayoutOrder=rowOrder
+    corner(Row,6); stroke(Row,C.SideBdr,1); Row.Parent=parent
+    local Indent=Instance.new("Frame")
+    Indent.Size=UDim2.new(0,2,0.45,0); Indent.Position=UDim2.new(0,9,0.275,0)
+    Indent.BackgroundColor3=C.AccGlow; Indent.BorderSizePixel=0
+    corner(Indent,1); Indent.Parent=Row
+    local Lbl=Instance.new("TextLabel")
+    Lbl.Size=UDim2.new(1,-56,1,0); Lbl.Position=UDim2.new(0,18,0,0)
+    Lbl.BackgroundTransparency=1; Lbl.Text=text; Lbl.TextColor3=C.Sub
+    Lbl.TextSize=12; Lbl.Font=Enum.Font.Gotham
+    Lbl.TextXAlignment=Enum.TextXAlignment.Left; Lbl.Parent=Row
+    local Pill=Instance.new("Frame")
+    Pill.Size=UDim2.new(0,34,0,18); Pill.Position=UDim2.new(1,-44,0.5,-9)
+    Pill.BackgroundColor3=C.TogOff; Pill.BorderSizePixel=0
+    corner(Pill,9); Pill.Parent=Row
+    local Dot=Instance.new("Frame")
+    Dot.Size=UDim2.new(0,12,0,12); Dot.Position=UDim2.new(0,3,0.5,-6)
+    Dot.BackgroundColor3=Color3.fromRGB(130,130,150)
+    Dot.BorderSizePixel=0; corner(Dot,6); Dot.Parent=Pill
+    local state=false
+    local Btn=Instance.new("TextButton")
+    Btn.Size=UDim2.new(1,0,1,0); Btn.BackgroundTransparency=1; Btn.Text=""
+    Btn.ZIndex=3; Btn.Parent=Row
+    Btn.MouseButton1Click:Connect(function()
+        state=not state
+        TweenService:Create(Pill,TI,{BackgroundColor3=state and C.TogOn or C.TogOff}):Play()
+        TweenService:Create(Dot,TI,{
+            Position=state and UDim2.new(0,19,0.5,-6) or UDim2.new(0,3,0.5,-6),
+            BackgroundColor3=state and Color3.fromRGB(255,255,255) or Color3.fromRGB(130,130,150),
+        }):Play()
+        cb(state)
+    end)
+end
+
 local function makeSlider(parent, text, minV, maxV, defV, fmt, onChanged)
     rowOrder=rowOrder+1
     local Row=Instance.new("Frame")
@@ -534,7 +648,6 @@ local function makeSlider(parent, text, minV, maxV, defV, fmt, onChanged)
     Thumb.Position=UDim2.new(0,0,0.5,0)
     Thumb.BackgroundColor3=Color3.fromRGB(228,228,242)
     Thumb.BorderSizePixel=0; Thumb.Active=true; corner(Thumb,7); Thumb.Parent=Track
-
     local enabled=true
     local function setEnabled(on)
         enabled=on
@@ -588,7 +701,7 @@ end
 -- ══════════════════════════════════════════════════════════════════════════════
 rowOrder=0
 
-local setESPRangeEnabled, setFlySpeedEnabled
+local setESPRangeEnabled, setFOVEnabled, setAimStrengthEnabled, setFlySpeedEnabled
 
 -- ── Camuflagem ────────────────────────────────────────────────────────────────
 makeHeader(OptionsFrame, "●", "Camuflagem")
@@ -596,7 +709,7 @@ makeToggle(OptionsFrame, "Invisibility", "Torna o personagem invisível localmen
     ST.Invis=on; applyInvis(LocalPlayer.Character, on)
 end)
 
--- ── Visual ────────────────────────────────────────────────────────────────────
+-- ── Combate Visual ────────────────────────────────────────────────────────────
 makeHeader(OptionsFrame, "◉", "Combate Visual")
 makeToggle(OptionsFrame, "ESP", "Destaca jogadores através de paredes", function(on)
     ST.ESP=on
@@ -608,24 +721,42 @@ setESPRangeEnabled = makeSlider(OptionsFrame, "ESP Range", 100, 1000, 500, "%.0f
 end)
 setESPRangeEnabled(false)
 
+-- ── Mira Assistida ────────────────────────────────────────────────────────────
+makeHeader(OptionsFrame, "◎", "Mira Assistida")
+makeToggle(OptionsFrame, "Aimbot", "Mira automática na cabeça mais próxima", function(on)
+    ST.Aimbot=on; fovCircle.Visible=on
+    if setFOVEnabled         then setFOVEnabled(on)         end
+    if setAimStrengthEnabled then setAimStrengthEnabled(on) end
+end)
+
+-- sub-opção: TriggerBot (visualmente aninhado sob Aimbot)
+makeSubToggle(OptionsFrame, "TriggerBot — dispara ao cruzar hitbox inimiga", function(on)
+    ST.TriggerBot=on
+    if not on then
+        -- garante que o botão não fique travado caso seja desligado durante um press
+        pcall(function() if mouse1release then mouse1release() end end)
+    end
+end)
+
+setFOVEnabled = makeSlider(OptionsFrame, "FOV", 30, 300, 120, "%.0f", function(v)
+    CFG.AimbotFOV=v; fovCircle.Radius=v
+end)
+setFOVEnabled(false)
+
+setAimStrengthEnabled = makeSlider(OptionsFrame, "Aim Strength", 0, 150, 100, "%.0f%%", function(v)
+    CFG.AimbotStrength=v
+end)
+setAimStrengthEnabled(false)
+
 -- ── Voo ───────────────────────────────────────────────────────────────────────
 makeHeader(OptionsFrame, "◈", "Voo")
 makeToggle(OptionsFrame, "Fly", "Voa livremente · atravessa paredes e chão", function(on)
     if on then startFly() else stopFly() end
     if setFlySpeedEnabled then setFlySpeedEnabled(on) end
 end)
-
---[[
-  Controles em voo:
-    W / S     → frente / trás na direção da câmera (pitch incluído)
-    A / D     → strafe horizontal
-    Space     → sobe (eixo Y global)
-    LCtrl     → desce (eixo Y global)
-    LShift    → velocidade ×2
-]]
 setFlySpeedEnabled = makeSlider(OptionsFrame, "Fly Speed", 10, 200, 60, "%.0f", function(v)
     CFG.FlySpeed=v
 end)
 setFlySpeedEnabled(false)
 
-print("[VoidHub] v4.0 carregado.")
+print("[VoidHub] v5.0 carregado.")
