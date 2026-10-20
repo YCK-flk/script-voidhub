@@ -1,5 +1,5 @@
 -- language: Lua | executor: Synapse X / KRNL / Fluxus / Delta (PC)
--- VoidHub v5 — ESP · Invisibility · Aimbot · TriggerBot · Fly
+-- VoidHub v5 — ESP · Invisibility · Aimbot · TriggerBot · Wallbang · Fly
 
 local Players      = game:GetService("Players")
 local RunService   = game:GetService("RunService")
@@ -16,11 +16,10 @@ pcall(function()
 end)
 
 -- ── STATE ─────────────────────────────────────────────────────────────────────
-local ST  = { ESP=false, Invis=false, Aimbot=false, TriggerBot=false, Fly=false }
+local ST  = { ESP=false, Invis=false, Aimbot=false, TriggerBot=false, Wallbang=false, Fly=false }
 local CFG = {
-    ESPDist        = 500,
+    ESPDist        = 500,   -- range compartilhado: ESP *e* Aimbot
     AimbotFOV      = 120,
-    AimbotSmooth   = 0.18,   -- mantido para compatibilidade; não usado diretamente
     AimbotStrength = 100,
     FlySpeed       = 60,
 }
@@ -102,13 +101,7 @@ local fovCircle = newDraw("Circle",{
 -- ══════════════════════════════════════════════════════════════════════════════
 -- TRIGGERBOT
 -- ══════════════════════════════════════════════════════════════════════════════
---[[
-  Raycast do Camera.CFrame.Position em LookVector * 2000 studs.
-  RaycastParams exclui o char local para não auto-triggerar.
-  Se o hit for descendente de qualquer char inimigo → mouse1press + release.
-  Cooldown: 150 ms entre disparos para não travar a arma.
-]]
-local TRIGGER_CD    = 0.15   -- segundos entre disparos
+local TRIGGER_CD    = 0.15
 local lastTrigger   = 0
 local triggerParams = RaycastParams.new()
 triggerParams.FilterType = Enum.RaycastFilterType.Exclude
@@ -119,14 +112,9 @@ local function updateTriggerFilter()
 end
 
 local function triggerFire()
-    -- mouse1press / mouse1release: API do executor (Synapse X, KRNL, Fluxus)
-    pcall(function()
-        if mouse1press then mouse1press() end
-    end)
+    pcall(function() if mouse1press then mouse1press() end end)
     task.delay(0.06, function()
-        pcall(function()
-            if mouse1release then mouse1release() end
-        end)
+        pcall(function() if mouse1release then mouse1release() end end)
     end)
 end
 
@@ -134,12 +122,10 @@ local function triggerCheck()
     if not ST.TriggerBot then return end
     local now = tick()
     if now - lastTrigger < TRIGGER_CD then return end
-
     updateTriggerFilter()
     local origin = Camera.CFrame.Position
     local dir    = Camera.CFrame.LookVector * 2000
     local result = workspace:Raycast(origin, dir, triggerParams)
-
     if result and result.Instance then
         for _, p in ipairs(Players:GetPlayers()) do
             if p ~= LocalPlayer and p.Character
@@ -150,6 +136,51 @@ local function triggerCheck()
             end
         end
     end
+end
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- WALLBANG
+-- Desativa CanCollide em toda geometria do mapa (exceto personagens).
+-- Projéteis físicos atravessam paredes; raycasts client-side também passam.
+-- ══════════════════════════════════════════════════════════════════════════════
+local wallbangConn  = nil
+local wallbangParts = {}   -- [part] = valorOriginal
+
+local function isCharPart(p)
+    for _, pl in ipairs(Players:GetPlayers()) do
+        if pl.Character and p:IsDescendantOf(pl.Character) then
+            return true
+        end
+    end
+    return false
+end
+
+local function startWallbang()
+    ST.Wallbang = true
+    wallbangParts = {}
+    -- snapshot + desativa geometria existente
+    for _, p in ipairs(workspace:GetDescendants()) do
+        if p:IsA("BasePart") and not isCharPart(p) then
+            wallbangParts[p] = p.CanCollide
+            pcall(function() p.CanCollide = false end)
+        end
+    end
+    -- cobre parts adicionadas dinamicamente (projectiles, spawns, etc.)
+    wallbangConn = workspace.DescendantAdded:Connect(function(p)
+        if p:IsA("BasePart") and not isCharPart(p) then
+            wallbangParts[p] = p.CanCollide
+            pcall(function() p.CanCollide = false end)
+        end
+    end)
+end
+
+local function stopWallbang()
+    ST.Wallbang = false
+    if wallbangConn then wallbangConn:Disconnect(); wallbangConn = nil end
+    for p, orig in pairs(wallbangParts) do
+        pcall(function() p.CanCollide = orig end)
+    end
+    wallbangParts = {}
 end
 
 -- ══════════════════════════════════════════════════════════════════════════════
@@ -217,7 +248,16 @@ end
 -- re-aplica estados ao respawnar
 LocalPlayer.CharacterAdded:Connect(function(char)
     task.wait(0.5)
-    if ST.Invis then applyInvis(char, true) end
+    if ST.Invis    then applyInvis(char, true) end
+    if ST.Wallbang then
+        -- exclui o novo char do snapshot
+        for _, p in ipairs(char:GetDescendants()) do
+            if p:IsA("BasePart") then
+                wallbangParts[p] = nil
+                pcall(function() p.CanCollide = true end)
+            end
+        end
+    end
     if ST.Fly then
         if flyConn then flyConn:Disconnect(); flyConn = nil end
         startFly()
@@ -226,6 +266,7 @@ end)
 
 -- ══════════════════════════════════════════════════════════════════════════════
 -- RENDER — ESP + Aimbot + TriggerBot
+-- Aimbot range = CFG.ESPDist (mesmo slider do ESP)
 -- ══════════════════════════════════════════════════════════════════════════════
 local mainConn = RunService.RenderStepped:Connect(function(deltaTime)
     local vp     = Camera.ViewportSize
@@ -242,8 +283,10 @@ local mainConn = RunService.RenderStepped:Connect(function(deltaTime)
         local head = char:FindFirstChild("Head")
         if not root or not head then hideEntry(e); continue end
 
-        -- aimbot target acquisition
-        if ST.Aimbot then
+        local worldDist = (Camera.CFrame.Position - root.Position).Magnitude
+
+        -- aimbot: herda CFG.ESPDist como limite de mundo
+        if ST.Aimbot and worldDist <= CFG.ESPDist then
             local sp, ok = w2s(head.Position)
             if ok then
                 local sd = (sp - center).Magnitude
@@ -252,7 +295,7 @@ local mainConn = RunService.RenderStepped:Connect(function(deltaTime)
         end
 
         -- ESP
-        if not ST.ESP or (Camera.CFrame.Position-root.Position).Magnitude > CFG.ESPDist then
+        if not ST.ESP or worldDist > CFG.ESPDist then
             hideEntry(e)
         else
             local tW = head.Position + Vector3.new(0, head.Size.Y*.5+.1, 0)
@@ -291,7 +334,6 @@ local mainConn = RunService.RenderStepped:Connect(function(deltaTime)
             CFrame.new(Camera.CFrame.Position, bestHead.Position), alpha)
     end
 
-    -- triggerbot (roda no mesmo frame após o aimbot para aproveitar a câmera já corrigida)
     triggerCheck()
 end)
 
@@ -308,16 +350,17 @@ local function cleanup()
     mainConn:Disconnect()
     fovCircle:Remove()
     stopFly()
+    stopWallbang()
     for p in pairs(pool) do dropEntry(p) end
     for _,c in ipairs(sliderConns) do pcall(function() c:Disconnect() end) end
 end
 _G.VH_cleanup = cleanup
 
 -- ══════════════════════════════════════════════════════════════════════════════
--- GUI — tokens de design (idênticos ao v3/v4)
+-- GUI
 -- ══════════════════════════════════════════════════════════════════════════════
 local W     = 500
-local H     = 430   -- altura aumentada para acomodar seções extras
+local H     = 490   -- altura aumentada para nova seção Wallbang
 local BAR_H =  44
 
 local C = {
@@ -507,7 +550,7 @@ OptionsPad.PaddingTop=UDim.new(0,10); OptionsPad.PaddingBottom=UDim.new(0,10)
 OptionsPad.Parent=OptionsFrame
 
 -- ══════════════════════════════════════════════════════════════════════════════
--- COMPONENTES (idênticos ao v3)
+-- COMPONENTES
 -- ══════════════════════════════════════════════════════════════════════════════
 local rowOrder=0
 
@@ -716,24 +759,23 @@ makeToggle(OptionsFrame, "ESP", "Destaca jogadores através de paredes", functio
     if setESPRangeEnabled then setESPRangeEnabled(on) end
     if not on then for _,e in pairs(pool) do hideEntry(e) end end
 end)
-setESPRangeEnabled = makeSlider(OptionsFrame, "ESP Range", 100, 1000, 500, "%.0f", function(v)
+-- range único: controla ESP *e* Aimbot
+setESPRangeEnabled = makeSlider(OptionsFrame, "ESP / Aimbot Range", 100, 1000, 500, "%.0f", function(v)
     CFG.ESPDist=v
 end)
 setESPRangeEnabled(false)
 
 -- ── Mira Assistida ────────────────────────────────────────────────────────────
 makeHeader(OptionsFrame, "◎", "Mira Assistida")
-makeToggle(OptionsFrame, "Aimbot", "Mira automática na cabeça mais próxima", function(on)
+makeToggle(OptionsFrame, "Aimbot", "Mira automática · range sincronizado com ESP", function(on)
     ST.Aimbot=on; fovCircle.Visible=on
     if setFOVEnabled         then setFOVEnabled(on)         end
     if setAimStrengthEnabled then setAimStrengthEnabled(on) end
 end)
 
--- sub-opção: TriggerBot (visualmente aninhado sob Aimbot)
 makeSubToggle(OptionsFrame, "TriggerBot — dispara ao cruzar hitbox inimiga", function(on)
     ST.TriggerBot=on
     if not on then
-        -- garante que o botão não fique travado caso seja desligado durante um press
         pcall(function() if mouse1release then mouse1release() end end)
     end
 end)
@@ -747,6 +789,12 @@ setAimStrengthEnabled = makeSlider(OptionsFrame, "Aim Strength", 0, 150, 100, "%
     CFG.AimbotStrength=v
 end)
 setAimStrengthEnabled(false)
+
+-- ── Penetração Balística ──────────────────────────────────────────────────────
+makeHeader(OptionsFrame, "◆", "Penetração Balística")
+makeToggle(OptionsFrame, "Wallbang", "Balas ignoram colisão com paredes e geometria do mapa", function(on)
+    if on then startWallbang() else stopWallbang() end
+end)
 
 -- ── Voo ───────────────────────────────────────────────────────────────────────
 makeHeader(OptionsFrame, "◈", "Voo")
