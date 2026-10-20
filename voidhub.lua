@@ -18,10 +18,11 @@ end)
 -- ── STATE ─────────────────────────────────────────────────────────────────────
 local ST  = { ESP=false, Invis=false, Aimbot=false, TriggerBot=false, Wallbang=false, Fly=false }
 local CFG = {
-    ESPDist        = 500,   -- range compartilhado: ESP *e* Aimbot
+    ESPDist        = 500,
     AimbotFOV      = 120,
     AimbotStrength = 100,
     FlySpeed       = 60,
+    WallbangDur    = 0.20,  -- segundos que as paredes ficam sem colisão após cada disparo
 }
 
 -- ══════════════════════════════════════════════════════════════════════════════
@@ -112,7 +113,7 @@ local function updateTriggerFilter()
 end
 
 local function triggerFire()
-    pcall(function() if mouse1press then mouse1press() end end)
+    pcall(function() if mouse1press   then mouse1press()   end end)
     task.delay(0.06, function()
         pcall(function() if mouse1release then mouse1release() end end)
     end)
@@ -139,12 +140,21 @@ local function triggerCheck()
 end
 
 -- ══════════════════════════════════════════════════════════════════════════════
--- WALLBANG
--- Desativa CanCollide em toda geometria do mapa (exceto personagens).
--- Projéteis físicos atravessam paredes; raycasts client-side também passam.
+-- WALLBANG (per-shot, floor-safe)
+--
+-- Lógica:
+--   1. Detecta Mouse1 via UIS.InputBegan
+--   2. Raycast downward do HumanoidRootPart → identifica a parte do chão atual
+--   3. Exclui: chão detectado + todos os chars de jogadores
+--   4. Seta CanCollide=false em tudo mais por CFG.WallbangDur segundos
+--   5. Restaura valores originais ao final da janela
+--
+-- Resultado: balas físicas atravessam paredes; o personagem continua colidindo
+-- com o chão e não sofre noclip durante a movimentação normal.
 -- ══════════════════════════════════════════════════════════════════════════════
-local wallbangConn  = nil
-local wallbangParts = {}   -- [part] = valorOriginal
+local wbInputConn  = nil
+local wbTimer      = nil
+local wbSnapshot   = {}   -- [part] = originalCanCollide
 
 local function isCharPart(p)
     for _, pl in ipairs(Players:GetPlayers()) do
@@ -155,32 +165,75 @@ local function isCharPart(p)
     return false
 end
 
-local function startWallbang()
-    ST.Wallbang = true
-    wallbangParts = {}
-    -- snapshot + desativa geometria existente
+-- Retorna as partes que estão agindo como chão sob todos os jogadores locais.
+-- Protegemos o chão embaixo do *nosso* char para o personagem não cair.
+local groundRayParams = RaycastParams.new()
+groundRayParams.FilterType = Enum.RaycastFilterType.Exclude
+
+local function collectGroundParts()
+    local protected = {}
+    local char = LocalPlayer.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if not root then return protected end
+
+    -- exclui o próprio char do raycast
+    groundRayParams.FilterDescendantsInstances = {char}
+
+    -- ray para baixo: 4.5 studs cobre a maioria das geometrias de chão
+    local result = workspace:Raycast(root.Position, Vector3.new(0, -4.5, 0), groundRayParams)
+    if result and result.Instance then
+        protected[result.Instance] = true
+    end
+    return protected
+end
+
+local function wbRestore()
+    for p, orig in pairs(wbSnapshot) do
+        pcall(function() p.CanCollide = orig end)
+    end
+    wbSnapshot = {}
+end
+
+local function wbFire()
+    -- cancela janela anterior (tiro rápido)
+    if wbTimer then task.cancel(wbTimer); wbTimer = nil end
+    -- restaura snapshot anterior antes de tirar novo
+    wbRestore()
+
+    local grounds = collectGroundParts()
+
     for _, p in ipairs(workspace:GetDescendants()) do
-        if p:IsA("BasePart") and not isCharPart(p) then
-            wallbangParts[p] = p.CanCollide
+        if p:IsA("BasePart")
+           and not isCharPart(p)
+           and not grounds[p]
+        then
+            wbSnapshot[p] = p.CanCollide
             pcall(function() p.CanCollide = false end)
         end
     end
-    -- cobre parts adicionadas dinamicamente (projectiles, spawns, etc.)
-    wallbangConn = workspace.DescendantAdded:Connect(function(p)
-        if p:IsA("BasePart") and not isCharPart(p) then
-            wallbangParts[p] = p.CanCollide
-            pcall(function() p.CanCollide = false end)
+
+    -- janela: 200 ms é suficiente para qualquer projétil físico cruzar uma parede fina/média
+    wbTimer = task.delay(CFG.WallbangDur, function()
+        wbRestore()
+        wbTimer = nil
+    end)
+end
+
+local function startWallbang()
+    ST.Wallbang = true
+    wbInputConn = UIS.InputBegan:Connect(function(input, gameProcessed)
+        if gameProcessed then return end
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            wbFire()
         end
     end)
 end
 
 local function stopWallbang()
     ST.Wallbang = false
-    if wallbangConn then wallbangConn:Disconnect(); wallbangConn = nil end
-    for p, orig in pairs(wallbangParts) do
-        pcall(function() p.CanCollide = orig end)
-    end
-    wallbangParts = {}
+    if wbInputConn then wbInputConn:Disconnect(); wbInputConn = nil end
+    if wbTimer     then task.cancel(wbTimer);     wbTimer = nil     end
+    wbRestore()
 end
 
 -- ══════════════════════════════════════════════════════════════════════════════
@@ -220,12 +273,12 @@ local function startFly()
         if right.Magnitude > 0 then right = right.Unit end
 
         local move = Vector3.new(0,0,0)
-        if UIS:IsKeyDown(Enum.KeyCode.W)            then move = move + look          end
-        if UIS:IsKeyDown(Enum.KeyCode.S)            then move = move - look          end
-        if UIS:IsKeyDown(Enum.KeyCode.A)            then move = move - right         end
-        if UIS:IsKeyDown(Enum.KeyCode.D)            then move = move + right         end
-        if UIS:IsKeyDown(Enum.KeyCode.Space)        then move = move + Vector3.yAxis end
-        if UIS:IsKeyDown(Enum.KeyCode.LeftControl)  then move = move - Vector3.yAxis end
+        if UIS:IsKeyDown(Enum.KeyCode.W)           then move = move + look          end
+        if UIS:IsKeyDown(Enum.KeyCode.S)           then move = move - look          end
+        if UIS:IsKeyDown(Enum.KeyCode.A)           then move = move - right         end
+        if UIS:IsKeyDown(Enum.KeyCode.D)           then move = move + right         end
+        if UIS:IsKeyDown(Enum.KeyCode.Space)       then move = move + Vector3.yAxis end
+        if UIS:IsKeyDown(Enum.KeyCode.LeftControl) then move = move - Vector3.yAxis end
 
         local speed = CFG.FlySpeed
         if UIS:IsKeyDown(Enum.KeyCode.LeftShift) then speed = speed * 2 end
@@ -245,19 +298,9 @@ local function stopFly()
     if h then h.PlatformStand = false end
 end
 
--- re-aplica estados ao respawnar
 LocalPlayer.CharacterAdded:Connect(function(char)
     task.wait(0.5)
-    if ST.Invis    then applyInvis(char, true) end
-    if ST.Wallbang then
-        -- exclui o novo char do snapshot
-        for _, p in ipairs(char:GetDescendants()) do
-            if p:IsA("BasePart") then
-                wallbangParts[p] = nil
-                pcall(function() p.CanCollide = true end)
-            end
-        end
-    end
+    if ST.Invis then applyInvis(char, true) end
     if ST.Fly then
         if flyConn then flyConn:Disconnect(); flyConn = nil end
         startFly()
@@ -266,7 +309,6 @@ end)
 
 -- ══════════════════════════════════════════════════════════════════════════════
 -- RENDER — ESP + Aimbot + TriggerBot
--- Aimbot range = CFG.ESPDist (mesmo slider do ESP)
 -- ══════════════════════════════════════════════════════════════════════════════
 local mainConn = RunService.RenderStepped:Connect(function(deltaTime)
     local vp     = Camera.ViewportSize
@@ -285,7 +327,6 @@ local mainConn = RunService.RenderStepped:Connect(function(deltaTime)
 
         local worldDist = (Camera.CFrame.Position - root.Position).Magnitude
 
-        -- aimbot: herda CFG.ESPDist como limite de mundo
         if ST.Aimbot and worldDist <= CFG.ESPDist then
             local sp, ok = w2s(head.Position)
             if ok then
@@ -294,7 +335,6 @@ local mainConn = RunService.RenderStepped:Connect(function(deltaTime)
             end
         end
 
-        -- ESP
         if not ST.ESP or worldDist > CFG.ESPDist then
             hideEntry(e)
         else
@@ -325,7 +365,6 @@ local mainConn = RunService.RenderStepped:Connect(function(deltaTime)
         end
     end
 
-    -- aimbot lerp (decaimento exponencial, framerate-independente)
     if ST.Aimbot and bestHead then
         local s = CFG.AimbotStrength
         local k = s <= 100 and (12*(s/100)) or (12+(s-100)*1.76)
@@ -360,12 +399,11 @@ _G.VH_cleanup = cleanup
 -- GUI
 -- ══════════════════════════════════════════════════════════════════════════════
 local W     = 500
-local H     = 490   -- altura aumentada para nova seção Wallbang
+local H     = 490
 local BAR_H =  44
 
 local C = {
     BG      = Color3.fromRGB(12, 12, 16),
-    Sidebar = Color3.fromRGB( 8,  8, 12),
     Bar     = Color3.fromRGB( 8,  8, 12),
     Row     = Color3.fromRGB(20, 20, 26),
     RowHov  = Color3.fromRGB(28, 28, 36),
@@ -560,9 +598,9 @@ local function makeHeader(parent, icon, text)
     Row.Size=UDim2.new(1,0,0,28); Row.BackgroundTransparency=1
     Row.BorderSizePixel=0; Row.LayoutOrder=rowOrder; Row.Parent=parent
     local Ico=Instance.new("TextLabel")
-    Ico.Size=UDim2.new(0,16,1,0); Ico.Position=UDim2.new(0,0,0,0)
-    Ico.BackgroundTransparency=1; Ico.Text=icon; Ico.TextColor3=C.AccGlow
-    Ico.TextSize=11; Ico.Font=Enum.Font.GothamBold
+    Ico.Size=UDim2.new(0,16,1,0); Ico.BackgroundTransparency=1
+    Ico.Text=icon; Ico.TextColor3=C.AccGlow; Ico.TextSize=11
+    Ico.Font=Enum.Font.GothamBold
     Ico.TextXAlignment=Enum.TextXAlignment.Left; Ico.Parent=Row
     local Lbl=Instance.new("TextLabel")
     Lbl.Size=UDim2.new(1,-20,1,0); Lbl.Position=UDim2.new(0,18,0,0)
@@ -743,60 +781,48 @@ end
 -- CONSTRUÇÃO
 -- ══════════════════════════════════════════════════════════════════════════════
 rowOrder=0
-
 local setESPRangeEnabled, setFOVEnabled, setAimStrengthEnabled, setFlySpeedEnabled
 
--- ── Camuflagem ────────────────────────────────────────────────────────────────
 makeHeader(OptionsFrame, "●", "Camuflagem")
 makeToggle(OptionsFrame, "Invisibility", "Torna o personagem invisível localmente", function(on)
     ST.Invis=on; applyInvis(LocalPlayer.Character, on)
 end)
 
--- ── Combate Visual ────────────────────────────────────────────────────────────
 makeHeader(OptionsFrame, "◉", "Combate Visual")
 makeToggle(OptionsFrame, "ESP", "Destaca jogadores através de paredes", function(on)
     ST.ESP=on
     if setESPRangeEnabled then setESPRangeEnabled(on) end
     if not on then for _,e in pairs(pool) do hideEntry(e) end end
 end)
--- range único: controla ESP *e* Aimbot
 setESPRangeEnabled = makeSlider(OptionsFrame, "ESP / Aimbot Range", 100, 1000, 500, "%.0f", function(v)
     CFG.ESPDist=v
 end)
 setESPRangeEnabled(false)
 
--- ── Mira Assistida ────────────────────────────────────────────────────────────
 makeHeader(OptionsFrame, "◎", "Mira Assistida")
 makeToggle(OptionsFrame, "Aimbot", "Mira automática · range sincronizado com ESP", function(on)
     ST.Aimbot=on; fovCircle.Visible=on
     if setFOVEnabled         then setFOVEnabled(on)         end
     if setAimStrengthEnabled then setAimStrengthEnabled(on) end
 end)
-
 makeSubToggle(OptionsFrame, "TriggerBot — dispara ao cruzar hitbox inimiga", function(on)
     ST.TriggerBot=on
-    if not on then
-        pcall(function() if mouse1release then mouse1release() end end)
-    end
+    if not on then pcall(function() if mouse1release then mouse1release() end end) end
 end)
-
 setFOVEnabled = makeSlider(OptionsFrame, "FOV", 30, 300, 120, "%.0f", function(v)
     CFG.AimbotFOV=v; fovCircle.Radius=v
 end)
 setFOVEnabled(false)
-
 setAimStrengthEnabled = makeSlider(OptionsFrame, "Aim Strength", 0, 150, 100, "%.0f%%", function(v)
     CFG.AimbotStrength=v
 end)
 setAimStrengthEnabled(false)
 
--- ── Penetração Balística ──────────────────────────────────────────────────────
 makeHeader(OptionsFrame, "◆", "Penetração Balística")
-makeToggle(OptionsFrame, "Wallbang", "Balas ignoram colisão com paredes e geometria do mapa", function(on)
+makeToggle(OptionsFrame, "Wallbang", "Balas atravessam paredes · personagem mantém colisão normal", function(on)
     if on then startWallbang() else stopWallbang() end
 end)
 
--- ── Voo ───────────────────────────────────────────────────────────────────────
 makeHeader(OptionsFrame, "◈", "Voo")
 makeToggle(OptionsFrame, "Fly", "Voa livremente · atravessa paredes e chão", function(on)
     if on then startFly() else stopFly() end
